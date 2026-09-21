@@ -1,0 +1,8 @@
+- if config.txt exists, then dont ask for nickname or password (server should get everything of the config.txt and client should get the nickname from config.txt same for global)
+- quit functionality in menu
+
+Error?
+- Cant find server anymore. Error or not?
+
+Features
+- translation
