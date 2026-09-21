@@ -1,5 +1,6 @@
 port=5000
 max_members=10
-room_name=
+room_name=Chat-Room
 password=
 nickname=
+room_salt=8f2c3b6e3a1d9c4b7e0a5f12d8c6b4a1

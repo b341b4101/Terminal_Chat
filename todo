@@ -1,8 +1,4 @@
-- if config.txt exists, then dont ask for nickname or password (server should get everything of the config.txt and client should get the nickname from config.txt same for global)
-- quit functionality in menu
-
-Error?
-- Cant find server anymore. Error or not?
-
-Features
-- translation
+Remaining intentional limitations:
+- Hostless UDP mode is not authenticated and is only suitable for casual LAN use.
+- Private rooms use password authentication rather than certificates or forward secrecy.
+- No artificial total file-size limit is imposed; disk space and OS limits still apply.
