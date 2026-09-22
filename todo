@@ -34,13 +34,13 @@ Implemented in the current version:
 
 ## Remaining chat and user-experience work
 
-- [ ] Add clearer first-run setup instead of asking many raw questions.
-- [ ] Add command autocomplete and command-specific help.
-- [ ] Add colored message types and optional desktop notifications.
-- [ ] Add configurable and remembered download folders.
-- [ ] Add room-owner controls such as muting, kicking, or banning participants.
+- [x] Add clearer first-run setup instead of asking many raw questions.
+- [x] Add command autocomplete where the terminal provides `readline` and command-specific help.
+- [x] Add colored message types and optional desktop/terminal notifications.
+- [x] Add configurable and remembered download folders.
+- [x] Add room-owner controls such as muting, kicking, or banning participants.
 - [ ] Add multiple named rooms on one server.
-- [ ] Add typing indicators or a composing status.
+- [x] Add typing indicators or a composing status.
 
 ## Remaining architecture and distribution work
 

@@ -35,6 +35,6 @@ Private room messages and file chunks use AES-256-GCM with a fresh nonce per mes
 
 The open-room mode is intentionally public: its shared key is available to every participant. It should not be used for sensitive data. UDP discovery responses are treated only as a room directory; after selection, the TCP connection performs a fresh HMAC challenge-response using the room password before any nickname or chat data is accepted. This prevents a spoofed discovery response or wrong-password client from joining a room.
 
-Hosts also enforce configurable per-file and total room-storage limits (`max_file_size_mb` and `max_room_storage_mb`, with defaults of 2048 MiB and 8192 MiB). Files exceeding either limit are rejected before the server stores them. `/who`, `/msg`, `/history`, timestamps, and heartbeat messages are supported in the TCP room.
+Hosts also enforce configurable per-file and total room-storage limits (`max_file_size_mb` and `max_room_storage_mb`, with defaults of 2048 MiB and 8192 MiB). Files exceeding either limit are rejected before the server stores them. The terminal room supports `/who`, `/msg`, `/history`, `/typing on|off`, timestamps, colored output, optional notifications, command completion where the terminal supports it, and host-only `/kick`, `/ban`, `/unban`, `/mute`, and `/unmute` controls. The last download folder is remembered in `download_dir`.
 
 This is still a local-network application, not a replacement for a mature audited messenger. There are no automated reconnects, certificate-based identity checks, or forward secrecy.

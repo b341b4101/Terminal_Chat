@@ -1,5 +1,5 @@
 """Hardened LAN chat: bounded control frames and chunked, encrypted file streaming."""
-import hashlib, hmac, json, os, secrets, shlex, shutil, socket, struct, tempfile, threading, time, zipfile
+import hashlib, hmac, json, os, secrets, shlex, shutil, socket, struct, sys, tempfile, threading, time, zipfile
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -12,6 +12,34 @@ GLOBAL_PORT=52731; GLOBAL_PASSWORD="open-world-chat-fixed"; CONFIG_FILE="config.
 MAX_FILE_SIZE=2*1024*1024*1024
 MAX_ROOM_STORAGE=8*1024*1024*1024
 class QuitProgram(Exception): pass
+
+ANSI={"system":"\\033[36m","error":"\\033[31m","private":"\\033[35m","file":"\\033[33m","reset":"\\033[0m"}
+def colorize(text,kind="system"):
+    if not sys.stdout.isatty() or os.environ.get("NO_COLOR"): return text
+    return ANSI.get(kind,"")+text+ANSI["reset"]
+def notify():
+    if os.environ.get("CHAT_NO_NOTIFY"): return
+    try:
+        if os.name=="nt":
+            import winsound; winsound.MessageBeep()
+        else: print("\\a",end="",flush=True)
+    except Exception: pass
+def config_save(config,path=CONFIG_FILE):
+    try:
+        with open(path,"w",encoding="utf8") as f:
+            for k,v in config.items(): f.write(f"{k}={v}\n")
+    except OSError: pass
+
+COMMANDS=["/upload","/download","/who","/msg","/history","/typing","/kick","/ban","/unban","/mute","/unmute","/help","/exit","/quit"]
+def setup_completion():
+    try:
+        import readline
+        def complete(text,state):
+            options=[c for c in COMMANDS if c.startswith(text)]
+            return options[state] if state<len(options) else None
+        readline.set_completer(complete); readline.parse_and_bind("tab: complete")
+    except (ImportError,AttributeError):
+        pass
 
 def clear_terminal():
     """Clear old output without clearing messages while a room is active."""
@@ -124,7 +152,7 @@ def target(name,directory):
     while os.path.exists(out):out=f"{stem}_{i}{ext}"; i+=1
     return out
 
-DEFAULT={"port":"5000","max_members":"10","room_name":"Chat-Room","password":"","nickname":"","room_salt":"","max_file_size_mb":"2048","max_room_storage_mb":"8192"}
+DEFAULT={"port":"5000","max_members":"10","room_name":"Chat-Room","password":"","nickname":"","room_salt":"","max_file_size_mb":"2048","max_room_storage_mb":"8192","download_dir":"."}
 def config_load(path=CONFIG_FILE):
     c=DEFAULT.copy()
     if os.path.exists(path):
@@ -136,10 +164,7 @@ def config_load(path=CONFIG_FILE):
                         if k in c:c[k]=v
         except OSError:pass
     else:
-        try:
-            with open(path,"w",encoding="utf8") as f:
-                for k,v in c.items():f.write(f"{k}={v}\n")
-        except OSError:pass
+        config_save(c,path)
     try:
         c["port"]=int(c["port"]); c["max_members"]=int(c["max_members"])
         c["max_file_size_mb"]=int(c["max_file_size_mb"]); c["max_room_storage_mb"]=int(c["max_room_storage_mb"])
@@ -152,15 +177,12 @@ def config_load(path=CONFIG_FILE):
     except ValueError:salt=b""
     if len(salt)<SALT_SIZE:
         salt=secrets.token_bytes(SALT_SIZE); c["room_salt"]=salt.hex()
-        try:
-            with open(path,"w",encoding="utf8") as f:
-                for k,v in c.items():f.write(f"{k}={v}\n")
-        except OSError:pass
+        config_save(c,path)
     return c
 
 class Room:
     def __init__(self,max_file_size=MAX_FILE_SIZE,max_storage=MAX_ROOM_STORAGE):
-        self.clients={}; self.files={}; self.history=[]; self.next=1; self.max_file_size=max_file_size; self.max_storage=max_storage; self.lock=threading.Lock(); self.file_lock=threading.Lock(); self.stop=threading.Event(); self.tmp=tempfile.mkdtemp(prefix="chat_")
+        self.clients={}; self.files={}; self.history=[]; self.next=1; self.muted=set(); self.banned=set(); self.max_file_size=max_file_size; self.max_storage=max_storage; self.lock=threading.Lock(); self.file_lock=threading.Lock(); self.stop=threading.Event(); self.tmp=tempfile.mkdtemp(prefix="chat_")
     def close(self):self.stop.set(); shutil.rmtree(self.tmp,ignore_errors=True)
 def broadcast(room,aes,text,skip=None):
     with room.lock: recipients=[(s,x["send"]) for s,x in room.clients.items() if s is not skip]
@@ -232,6 +254,7 @@ def handler(sock,addr,aes,room,max_members,host):
         raw=receive_frame(sock); nick=decrypt(aes,raw).strip() if raw else ""
         if not 1<=len(nick)<=32 or "|" in nick or "\n" in nick:raise ValueError("invalid nickname")
         with room.lock:
+            if nick in room.banned:send_text(sock,aes,"SERVER: You are banned from this room.",send);return
             if max_members is not None and len(room.clients)>=max_members:send_text(sock,aes,"SERVER: Group is full.",send);return
             if nick==host or any(x["nick"]==nick for x in room.clients.values()):send_text(sock,aes,"SERVER: Nickname is taken.",send);return
             room.clients[sock]={"nick":nick,"send":send}
@@ -248,6 +271,26 @@ def handler(sock,addr,aes,room,max_members,host):
             if text=="__HISTORY__":
                 with room.lock: history=list(room.history)
                 send_text(sock,aes,"SERVER: Recent messages:\n"+("\n".join(history) if history else "(none)"),send);continue
+            if text.startswith("__TYPING__|"):
+                status=text.split("|",1)[1]
+                broadcast(room,aes,f"[typing] {nick} {'is typing' if status=='on' else 'stopped typing'}",sock);continue
+            if text.startswith("__MOD__|"):
+                action,target_name=text[8:].split("|",1) if "|" in text[8:] else ("","")
+                if nick!=host:send_text(sock,aes,"SERVER: Only the host can moderate the room.",send);continue
+                with room.lock:
+                    target_socket=next((s for s,x in room.clients.items() if x["nick"]==target_name),None)
+                    if action=="ban":room.banned.add(target_name)
+                    elif action=="unban":room.banned.discard(target_name)
+                    elif action=="mute":room.muted.add(target_name)
+                    elif action=="unmute":room.muted.discard(target_name)
+                if action in ("kick","ban") and target_socket:
+                    label="kicked" if action=="kick" else "banned"
+                    send_text(target_socket,aes,f"SERVER: You were {label} by the host.",room.clients[target_socket]["send"])
+                    try:target_socket.shutdown(socket.SHUT_RDWR)
+                    except OSError:pass
+                send_text(sock,aes,f"SERVER: {action} applied to {target_name}.",send);continue
+            if nick in room.muted:
+                send_text(sock,aes,"SERVER: You are muted.",send);continue
             if text.startswith("__MSG__|"):
                 target_name,message=text[8:].split("|",1) if "|" in text[8:] else ("","")
                 with room.lock: recipient=next(((s,x["send"]) for s,x in room.clients.items() if x["nick"]==target_name),None)
@@ -326,9 +369,16 @@ def server_download(aes,room,n,d):
     if not es or any(e is None for e in es):print("[Invalid file number]");return
     for e in es:save_file(aes,e,d)
 
-HELP="/upload <path> | /download | /download <n> [folder] | /download -a [folder] | /who | /msg <nick> <text> | /history | /help | /exit | /quit"
+HELP="/upload <path> | /download [n] [folder] | /who | /msg <nick> <text> | /history | /typing on|off | /kick /ban /unban /mute /unmute <nick> | /help | /exit | /quit"
 def run_server():
-    c=config_load(); password=c["password"]; kind="global" if not password else "private"; password=password or GLOBAL_PASSWORD
+    first_run=not os.path.exists(CONFIG_FILE); c=config_load()
+    if first_run:
+        print("First-run setup: choose a room name and password. Leave password empty for an open room.")
+        c["room_name"]=input(f"Room name [{c['room_name']}]: ").strip() or c["room_name"]
+        c["password"]=input("Room password (empty = open room): ")
+        c["nickname"]=input("Your nickname [Server]: ").strip() or "Server"
+        config_save(c)
+    password=c["password"]; kind="global" if not password else "private"; password=password or GLOBAL_PASSWORD
     salt=bytes.fromhex(c["room_salt"]); key=key_from_password(password,salt); nick=c["nickname"] or input("Your nickname: ").strip() or "Server";aes=AESGCM(key);room=Room(c["max_file_size_mb"]*1024*1024,c["max_room_storage_mb"]*1024*1024);server=socket.socket();server.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
     try:server.bind(("",c["port"]));server.listen(20)
     except OSError as e:print(e);room.close();return
@@ -345,7 +395,7 @@ def run_server():
                 if room.stop.is_set():break
                 continue
             threading.Thread(target=handler,args=(s,a,aes,room,None if kind=="global" else c["max_members"],nick),daemon=True).start()
-    threading.Thread(target=accept,daemon=True).start(); clear_terminal(); print(f"Room running on {c['port']}. Commands: {HELP}")
+    threading.Thread(target=accept,daemon=True).start(); clear_terminal(); setup_completion(); print(f"Room running on {c['port']}. Commands: {HELP}")
     try:
         while True:
             line=input("You: ")
@@ -390,7 +440,10 @@ def client_receive(sock,aes,state):
                     except OSError:pass
                     raise
                 print(f"\n[Saved as '{out}']\nYou: ",end="")
-            else:print(f"\r{msg}\nYou: ",end="")
+            else:
+                kind="private" if msg.startswith("[private ") else "system" if msg.startswith("SERVER:") or msg.startswith("[") else "message"
+                print(f"\r{colorize(msg,kind)}\nYou: ",end="")
+                if not msg.startswith("[typing]"):notify()
     except (InvalidTag,ValueError,UnicodeError,OSError,ConnectionError,TypeError) as e:print(f"\n[Connection closed: {e}]")
 def client_upload(sock,aes,lock,path):
     x=upload_source(path)
@@ -419,12 +472,12 @@ def run_client():
     else:ip=input("IP: ").strip() or "127.0.0.1";port=int(input("Port [5000]: ") or 5000);kind="private";shex=input("Room salt hex: ")
     try:salt=bytes.fromhex(shex);password=GLOBAL_PASSWORD if kind=="global" else input("Room password: ");key=key_from_password(password,salt);aes=AESGCM(key)
     except ValueError:print("[Invalid salt]");return
-    lock=threading.Lock();sock=None
+    lock=threading.Lock();sock=None; client_config=config_load()
     try:
-        sock=socket.create_connection((ip,port),10); authenticate_client(sock,key_from_password(password,salt)); client_config=config_load(); send_text(sock,aes,client_config["nickname"] or input("Nickname: ").strip() or "Guest",lock);reply=receive_frame(sock)
+        sock=socket.create_connection((ip,port),10); authenticate_client(sock,key_from_password(password,salt)); send_text(sock,aes,client_config["nickname"] or input("Nickname: ").strip() or "Guest",lock);reply=receive_frame(sock)
         if decrypt(aes,reply)!="__NICK_OK__":print(decrypt(aes,reply));sock.close();return
     except (OSError,InvalidTag,ValueError,UnicodeError) as e:print(f"[Connection failed: {e}]");return
-    state={"dir":".","stop":threading.Event()}; clear_terminal(); print(f"Connected to {ip}:{port}. File and message history starts here."); threading.Thread(target=client_receive,args=(sock,aes,state),daemon=True).start()
+    state={"dir":client_config.get("download_dir") or ".","stop":threading.Event()}; clear_terminal(); setup_completion(); print(f"Connected to {ip}:{port}. File and message history starts here."); threading.Thread(target=client_receive,args=(sock,aes,state),daemon=True).start()
     def heartbeat():
         while not state["stop"].wait(HEARTBEAT_SECONDS):
             try:send_text(sock,aes,"__PING__",lock)
@@ -439,13 +492,20 @@ def run_client():
             if line.startswith("/upload "):
                 for p in paths(line[9:]):client_upload(sock,aes,lock,p)
             elif line=="/who":send_text(sock,aes,"__WHO__",lock)
+            elif line in ("/typing on","/typing off"):
+                send_text(sock,aes,"__TYPING__|"+line.rsplit(None,1)[1],lock)
+            elif line.startswith("/kick "):send_text(sock,aes,"__MOD__|kick|"+line[6:].strip(),lock)
+            elif line.startswith("/ban "):send_text(sock,aes,"__MOD__|ban|"+line[5:].strip(),lock)
+            elif line.startswith("/unban "):send_text(sock,aes,"__MOD__|unban|"+line[7:].strip(),lock)
+            elif line.startswith("/mute "):send_text(sock,aes,"__MOD__|mute|"+line[6:].strip(),lock)
+            elif line.startswith("/unmute "):send_text(sock,aes,"__MOD__|unmute|"+line[8:].strip(),lock)
             elif line.startswith("/msg "):
                 parts=line[5:].split(None,1)
                 if len(parts)==2:send_text(sock,aes,"__MSG__|"+parts[0]+"|"+parts[1],lock)
                 else:print("Usage: /msg <nickname> <message>")
             elif line=="/download":send_text(sock,aes,"__LIST__",lock)
             elif line.startswith("/download "):
-                n,d=download_args(line[10:]);state["dir"]=d;send_text(sock,aes,"__GET__|"+n,lock)
+                n,d=download_args(line[10:]);state["dir"]=d;client_config["download_dir"]=d;config_save(client_config);send_text(sock,aes,"__GET__|"+n,lock)
             elif line=="/history":send_text(sock,aes,"__HISTORY__",lock)
             else:send_text(sock,aes,line,lock)
     except (EOFError,OSError):pass

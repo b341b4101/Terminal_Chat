@@ -50,7 +50,12 @@ The host keeps a current-room file index and removes temporary room storage when
 - `/download` — list available files.
 - `/download <number> [folder]` — download one file.
 - `/download -a [folder]` — download all files.
-- `/help` — show help.
+- `/who` — list participants.
+- `/msg <nickname> <text>` — send a private message.
+- `/history` — show recent room messages.
+- `/typing on|off` — show or clear a typing indicator.
+- `/kick`, `/ban`, `/unban`, `/mute`, `/unmute <nickname>` — host-only participant controls.
+- `/help` — show help. Tab completion is enabled when the local terminal provides Python's `readline` module.
 - `/exit` — leave the room and return to the main menu.
 - `/quit` — close the application.
 
@@ -74,6 +79,9 @@ Important settings in `config.txt`:
 - `room_salt`: generated automatically and needed for manual connections.
 - `max_file_size_mb`: largest accepted file.
 - `max_room_storage_mb`: total file storage allowed in one room.
+- `download_dir`: default folder for downloads; it is updated after specifying a download folder.
+
+On the first host run, the program asks for a room name, password, and host nickname. Output colors and notifications are automatic terminal conveniences; set `NO_COLOR=1` or `CHAT_NO_NOTIFY=1` to disable them.
 
 Never publish a private room password or its configuration file in a public repository.
 
