@@ -13,16 +13,23 @@ MAX_FILE_SIZE=2*1024*1024*1024
 MAX_ROOM_STORAGE=8*1024*1024*1024
 class QuitProgram(Exception): pass
 
-ANSI={"system":"\\033[36m","error":"\\033[31m","private":"\\033[35m","file":"\\033[33m","reset":"\\033[0m"}
+ANSI={"system":"\033[36m","error":"\033[31m","private":"\033[35m","file":"\033[33m","message":"\033[32m","reset":"\033[0m"}
 def colorize(text,kind="system"):
     if not sys.stdout.isatty() or os.environ.get("NO_COLOR"): return text
     return ANSI.get(kind,"")+text+ANSI["reset"]
+def message_kind(msg):
+    if msg.startswith("[private "): return "private"
+    if msg.startswith("SERVER:") or msg.startswith("[typing]"): return "system"
+    if "joined the group" in msg or "left the group" in msg: return "system"
+    if msg.startswith("[New file") or msg.startswith("[Saved as"): return "file"
+    if msg.startswith("[20") and "] " in msg: return "message"
+    return "system"
 def notify():
     if os.environ.get("CHAT_NO_NOTIFY"): return
     try:
         if os.name=="nt":
             import winsound; winsound.MessageBeep()
-        else: print("\\a",end="",flush=True)
+        else: print("\a",end="",flush=True)
     except Exception: pass
 def config_save(config,path=CONFIG_FILE):
     try:
@@ -258,7 +265,9 @@ def handler(sock,addr,aes,room,max_members,host):
             if max_members is not None and len(room.clients)>=max_members:send_text(sock,aes,"SERVER: Group is full.",send);return
             if nick==host or any(x["nick"]==nick for x in room.clients.values()):send_text(sock,aes,"SERVER: Nickname is taken.",send);return
             room.clients[sock]={"nick":nick,"send":send}
-        send_text(sock,aes,"__NICK_OK__",send); broadcast(room,aes,f"[{room_stamp()}] [{nick} joined the group]",sock)
+        joined=f"[{room_stamp()}] [{nick} joined the group]"
+        send_text(sock,aes,"__NICK_OK__",send); broadcast(room,aes,joined,sock)
+        print(f"\r{colorize(joined,'system')}\nYou: ",end="",flush=True)
         while not room.stop.is_set():
             try: raw=receive_frame(sock)
             except socket.timeout: raise ConnectionError("client heartbeat timed out")
@@ -312,15 +321,19 @@ def handler(sock,addr,aes,room,max_members,host):
                 p=os.path.join(room.tmp,secrets.token_hex(16)); digest=receive_upload(sock,aes,size,p)
                 with room.file_lock:n=room.next;room.next+=1;room.files[n]={"name":name,"size":size,"sha256":digest,"from":nick,"path":p}
                 send_text(sock,aes,f"SERVER: File uploaded as number {n}.",send);broadcast(room,aes,f"[New file available: {name} - see /download]",sock);continue
+            message=room_message(nick,text)
             with room.lock:
-                room.history.append(room_message(nick,text))
+                room.history.append(message)
                 room.history=room.history[-100:]
-            broadcast(room,aes,room_message(nick,text),sock)
+            broadcast(room,aes,message,sock)
+            print(f"\r{colorize(message,'message')}\nYou: ",end="",flush=True)
     except (InvalidTag,ValueError,UnicodeError,json.JSONDecodeError,OSError,ConnectionError):pass
     finally:
         if nick:
             with room.lock:room.clients.pop(sock,None)
-            broadcast(room,aes,f"[{room_stamp()}] [{nick} left the group]",sock)
+            left=f"[{room_stamp()}] [{nick} left the group]"
+            broadcast(room,aes,left,sock)
+            print(f"\r{colorize(left,'system')}\nYou: ",end="",flush=True)
         try:sock.close()
         except OSError:pass
 
@@ -439,9 +452,10 @@ def client_receive(sock,aes,state):
                     try:os.unlink(temp)
                     except OSError:pass
                     raise
-                print(f"\n[Saved as '{out}']\nYou: ",end="")
+                saved=colorize("[Saved as '"+out+"']","file")
+                print(f"\n{saved}\nYou: ",end="")
             else:
-                kind="private" if msg.startswith("[private ") else "system" if msg.startswith("SERVER:") or msg.startswith("[") else "message"
+                kind=message_kind(msg)
                 print(f"\r{colorize(msg,kind)}\nYou: ",end="")
                 if not msg.startswith("[typing]"):notify()
     except (InvalidTag,ValueError,UnicodeError,OSError,ConnectionError,TypeError) as e:print(f"\n[Connection closed: {e}]")
@@ -474,7 +488,7 @@ def run_client():
     except ValueError:print("[Invalid salt]");return
     lock=threading.Lock();sock=None; client_config=config_load()
     try:
-        sock=socket.create_connection((ip,port),10); authenticate_client(sock,key_from_password(password,salt)); send_text(sock,aes,client_config["nickname"] or input("Nickname: ").strip() or "Guest",lock);reply=receive_frame(sock)
+        sock=socket.create_connection((ip,port),10); authenticate_client(sock,key_from_password(password,salt)); sock.settimeout(None); send_text(sock,aes,client_config["nickname"] or input("Nickname: ").strip() or "Guest",lock);reply=receive_frame(sock)
         if decrypt(aes,reply)!="__NICK_OK__":print(decrypt(aes,reply));sock.close();return
     except (OSError,InvalidTag,ValueError,UnicodeError) as e:print(f"[Connection failed: {e}]");return
     state={"dir":client_config.get("download_dir") or ".","stop":threading.Event()}; clear_terminal(); setup_completion(); print(f"Connected to {ip}:{port}. File and message history starts here."); threading.Thread(target=client_receive,args=(sock,aes,state),daemon=True).start()

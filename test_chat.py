@@ -36,6 +36,20 @@ class ChatHelpersTests(unittest.TestCase):
             self.assertEqual(config["max_file_size_mb"], 2048)
             self.assertEqual(config["max_room_storage_mb"], 8192)
 
+    def test_room_message_contains_sender_and_text(self):
+        message = chat.room_message("Alice", "hello")
+        self.assertIn("Alice: hello", message)
+        self.assertTrue(message.startswith("["))
+
+    def test_terminal_colors_are_escape_codes_not_literal_text(self):
+        self.assertEqual(chat.ANSI["reset"], "\x1b[0m")
+        self.assertNotIn("\\033", chat.ANSI["reset"])
+
+    def test_client_message_colors_match_message_types(self):
+        self.assertEqual(chat.message_kind("[2026-09-22 15:00:00] Alice: hello"), "message")
+        self.assertEqual(chat.message_kind("[Alice joined the group]"), "system")
+        self.assertEqual(chat.message_kind("[private Alice -> you] hi"), "private")
+
     def test_authentication_challenge_round_trip(self):
         import socket
         key = os.urandom(32)
