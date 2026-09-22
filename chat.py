@@ -1,5 +1,5 @@
 """Hardened LAN chat: bounded control frames and chunked, encrypted file streaming."""
-import json, os, secrets, shlex, shutil, socket, struct, tempfile, threading, time, zipfile
+import hashlib, hmac, json, os, secrets, shlex, shutil, socket, struct, tempfile, threading, time, zipfile
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -8,6 +8,8 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 DISCOVERY_PORT=5001; DISCOVERY_REQUEST=b"CHAT_DISCOVER_V2"; DISCOVERY_PREFIX="CHAT_HERE_V2"
 FRAME_MAX=1024*1024; CHUNK=64*1024; TEXT_MAX=256*1024; SALT_SIZE=16
 GLOBAL_PORT=52731; GLOBAL_PASSWORD="open-world-chat-fixed"; CONFIG_FILE="config.txt"
+MAX_FILE_SIZE=2*1024*1024*1024
+MAX_ROOM_STORAGE=8*1024*1024*1024
 class QuitProgram(Exception): pass
 
 def clear_terminal():
@@ -37,6 +39,27 @@ def receive_exact(sock,n):
 def receive_frame(sock):
     h=receive_exact(sock,4)
     return None if h is None else receive_exact(sock,struct.unpack(">I",h)[0])
+
+def authenticate_server(sock,key):
+    """Prove possession of the room password before accepting encrypted chat data."""
+    challenge=secrets.token_bytes(32)
+    send_frame(sock,b"CHAT_AUTH_1"+challenge)
+    proof=receive_frame(sock)
+    expected=hmac.new(key,b"client"+challenge,hashlib.sha256).digest()
+    if proof is None or not hmac.compare_digest(proof,expected):
+        raise ValueError("room authentication failed")
+    send_frame(sock,b"CHAT_AUTH_2"+hmac.new(key,b"server"+challenge,hashlib.sha256).digest())
+
+def authenticate_client(sock,key):
+    hello=receive_frame(sock)
+    if hello is None or len(hello)!=43 or not hello.startswith(b"CHAT_AUTH_1"):
+        raise ValueError("invalid server authentication challenge")
+    challenge=hello[11:]
+    send_frame(sock,hmac.new(key,b"client"+challenge,hashlib.sha256).digest())
+    reply=receive_frame(sock)
+    expected=b"CHAT_AUTH_2"+hmac.new(key,b"server"+challenge,hashlib.sha256).digest()
+    if reply is None or not hmac.compare_digest(reply,expected):
+        raise ValueError("server authentication failed")
 class _NullLock:
     def __enter__(self): return self
     def __exit__(self,*args): pass
@@ -100,7 +123,7 @@ def target(name,directory):
     while os.path.exists(out):out=f"{stem}_{i}{ext}"; i+=1
     return out
 
-DEFAULT={"port":"5000","max_members":"10","room_name":"Chat-Room","password":"","nickname":"","room_salt":""}
+DEFAULT={"port":"5000","max_members":"10","room_name":"Chat-Room","password":"","nickname":"","room_salt":"","max_file_size_mb":"2048","max_room_storage_mb":"8192"}
 def config_load(path=CONFIG_FILE):
     c=DEFAULT.copy()
     if os.path.exists(path):
@@ -116,9 +139,14 @@ def config_load(path=CONFIG_FILE):
             with open(path,"w",encoding="utf8") as f:
                 for k,v in c.items():f.write(f"{k}={v}\n")
         except OSError:pass
-    try:c["port"]=int(c["port"]); c["max_members"]=int(c["max_members"])
-    except ValueError:c["port"],c["max_members"]=5000,10
+    try:
+        c["port"]=int(c["port"]); c["max_members"]=int(c["max_members"])
+        c["max_file_size_mb"]=int(c["max_file_size_mb"]); c["max_room_storage_mb"]=int(c["max_room_storage_mb"])
+    except ValueError:
+        c["port"],c["max_members"],c["max_file_size_mb"],c["max_room_storage_mb"]=5000,10,2048,8192
     if not 1024<=c["port"]<=65535 or c["max_members"]<1:c["port"],c["max_members"]=5000,10
+    if not 1<=c["max_file_size_mb"]<=2048:c["max_file_size_mb"]=2048
+    if not 1<=c["max_room_storage_mb"]<=8192:c["max_room_storage_mb"]=8192
     try:salt=bytes.fromhex(c["room_salt"])
     except ValueError:salt=b""
     if len(salt)<SALT_SIZE:
@@ -130,8 +158,8 @@ def config_load(path=CONFIG_FILE):
     return c
 
 class Room:
-    def __init__(self):
-        self.clients={}; self.files={}; self.next=1; self.lock=threading.Lock(); self.file_lock=threading.Lock(); self.stop=threading.Event(); self.tmp=tempfile.mkdtemp(prefix="chat_")
+    def __init__(self,max_file_size=MAX_FILE_SIZE,max_storage=MAX_ROOM_STORAGE):
+        self.clients={}; self.files={}; self.next=1; self.max_file_size=max_file_size; self.max_storage=max_storage; self.lock=threading.Lock(); self.file_lock=threading.Lock(); self.stop=threading.Event(); self.tmp=tempfile.mkdtemp(prefix="chat_")
     def close(self):self.stop.set(); shutil.rmtree(self.tmp,ignore_errors=True)
 def broadcast(room,aes,text,skip=None):
     with room.lock: recipients=[(s,x["send"]) for s,x in room.clients.items() if s is not skip]
@@ -216,7 +244,9 @@ def handler(sock,addr,aes,room,max_members,host):
                 continue
             if text.startswith("__UPLOAD__|"):
                 m=json.loads(text[11:]); name=safe_name(m.get("name")); size=m.get("size")
-                if not isinstance(size,int) or size<0:raise ValueError("invalid file size")
+                if not isinstance(size,int) or size<0 or size>room.max_file_size:raise ValueError("file exceeds the room file-size limit")
+                with room.file_lock:
+                    if sum(x["size"] for x in room.files.values())+size>room.max_storage:raise ValueError("room storage limit reached")
                 p=os.path.join(room.tmp,secrets.token_hex(16)); receive_upload(sock,aes,size,p)
                 with room.file_lock:n=room.next;room.next+=1;room.files[n]={"name":name,"size":size,"from":nick,"path":p}
                 send_text(sock,aes,f"SERVER: File uploaded as number {n}.",send);broadcast(room,aes,f"[New file available: {name} - see /download]",sock);continue
@@ -239,7 +269,14 @@ def store_local(aes,source,dest):
 def server_upload(aes,room,nick,path):
     x=upload_source(path)
     if not x:print(f"[Not found: {path}]");return
-    name,size,source,cleanup=x; dest=os.path.join(room.tmp,secrets.token_hex(16))
+    name,size,source,cleanup=x
+    if size>room.max_file_size or sum(e["size"] for e in room.files.values())+size>room.max_storage:
+        print("[File rejected: room file-size or storage limit exceeded]");
+        if cleanup:
+            try:os.unlink(source)
+            except OSError:pass
+        return
+    dest=os.path.join(room.tmp,secrets.token_hex(16))
     try:store_local(aes,source,dest);room.files[room.next]={"name":name,"size":size,"from":nick,"path":dest};room.next+=1;print(f"[Stored {name} ({size} bytes)]");broadcast(room,aes,f"[New file available: {name} - see /download]")
     finally:
         if cleanup:
@@ -268,14 +305,20 @@ def server_download(aes,room,n,d):
 HELP="/upload <path> | /download | /download <n> [folder] | /download -a [folder] | /help | /exit | /quit"
 def run_server():
     c=config_load(); password=c["password"]; kind="global" if not password else "private"; password=password or GLOBAL_PASSWORD
-    nick=c["nickname"] or input("Your nickname: ").strip() or "Server";aes=AESGCM(key_from_password(password,bytes.fromhex(c["room_salt"])));room=Room();server=socket.socket();server.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+    salt=bytes.fromhex(c["room_salt"]); key=key_from_password(password,salt); nick=c["nickname"] or input("Your nickname: ").strip() or "Server";aes=AESGCM(key);room=Room(c["max_file_size_mb"]*1024*1024,c["max_room_storage_mb"]*1024*1024);server=socket.socket();server.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
     try:server.bind(("",c["port"]));server.listen(20)
     except OSError as e:print(e);room.close();return
     threading.Thread(target=discovery,args=(c["room_name"] or "Chat-Room",c["port"],kind,c["room_salt"],room.stop),daemon=True).start()
     def accept():
         while not room.stop.is_set():
-            try:s,a=server.accept()
-            except OSError:break
+            s=None
+            try:s,a=server.accept(); authenticate_server(s,key)
+            except (OSError,ValueError):
+                if s is not None:
+                    try:s.close()
+                    except OSError:pass
+                if room.stop.is_set():break
+                continue
             threading.Thread(target=handler,args=(s,a,aes,room,None if kind=="global" else c["max_members"],nick),daemon=True).start()
     threading.Thread(target=accept,daemon=True).start(); clear_terminal(); print(f"Room running on {c['port']}. Commands: {HELP}")
     try:
@@ -334,11 +377,11 @@ def run_client():
         if ch.isdigit() and 1<=int(ch)<=len(found):ip,_r,port,kind,shex=found[int(ch)-1]
         else:ip=input("IP: ").strip() or "127.0.0.1";port=int(input("Port [5000]: ") or 5000);kind="private";shex=input("Room salt hex: ")
     else:ip=input("IP: ").strip() or "127.0.0.1";port=int(input("Port [5000]: ") or 5000);kind="private";shex=input("Room salt hex: ")
-    try:salt=bytes.fromhex(shex);password=GLOBAL_PASSWORD if kind=="global" else input("Room password: ");aes=AESGCM(key_from_password(password,salt))
+    try:salt=bytes.fromhex(shex);password=GLOBAL_PASSWORD if kind=="global" else input("Room password: ");key=key_from_password(password,salt);aes=AESGCM(key)
     except ValueError:print("[Invalid salt]");return
     lock=threading.Lock();sock=None
     try:
-        sock=socket.create_connection((ip,port),10); client_config=config_load(); send_text(sock,aes,client_config["nickname"] or input("Nickname: ").strip() or "Guest",lock);reply=receive_frame(sock)
+        sock=socket.create_connection((ip,port),10); authenticate_client(sock,key_from_password(password,salt)); client_config=config_load(); send_text(sock,aes,client_config["nickname"] or input("Nickname: ").strip() or "Guest",lock);reply=receive_frame(sock)
         if decrypt(aes,reply)!="__NICK_OK__":print(decrypt(aes,reply));sock.close();return
     except (OSError,InvalidTag,ValueError,UnicodeError) as e:print(f"[Connection failed: {e}]");return
     state={"dir":"."}; clear_terminal(); print(f"Connected to {ip}:{port}. File and message history starts here."); threading.Thread(target=client_receive,args=(sock,aes,state),daemon=True).start()

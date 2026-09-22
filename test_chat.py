@@ -27,12 +27,31 @@ class ChatHelpersTests(unittest.TestCase):
             result = chat.target("a.txt", directory)
             self.assertTrue(result.endswith("received_a_1.txt"))
 
-    def test_config_has_random_salt(self):
+    def test_config_has_random_salt_and_file_limits(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "config.txt")
             config = chat.config_load(path)
             self.assertEqual(len(bytes.fromhex(config["room_salt"])), chat.SALT_SIZE)
             self.assertEqual(chat.config_load(path)["room_salt"], config["room_salt"])
+            self.assertEqual(config["max_file_size_mb"], 2048)
+            self.assertEqual(config["max_room_storage_mb"], 8192)
+
+    def test_authentication_challenge_round_trip(self):
+        import socket
+        key = os.urandom(32)
+        left, right = socket.socketpair()
+        try:
+            import threading
+            result = []
+            thread = threading.Thread(target=lambda: result.append(chat.authenticate_server(left, key)))
+            thread.start()
+            chat.authenticate_client(right, key)
+            thread.join(timeout=1)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result, [None])
+        finally:
+            left.close()
+            right.close()
 
 
 if __name__ == "__main__":

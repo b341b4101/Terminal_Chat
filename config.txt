@@ -4,3 +4,5 @@ room_name=Chat-Room
 password=
 nickname=
 room_salt=8f2c3b6e3a1d9c4b7e0a5f12d8c6b4a1
+max_file_size_mb=2048
+max_room_storage_mb=8192
