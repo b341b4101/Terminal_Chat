@@ -25,7 +25,7 @@ Leaving `password` empty creates an open room using the legacy public-room key. 
 
 ## Files
 
-Files and folders are transferred in encrypted 64 KiB chunks. The program does **not** impose an artificial total file-size limit and does not load a complete file into RAM. The server stores encrypted chunks in a temporary directory and removes them when the room closes. Folder uploads are streamed from a temporary ZIP archive.
+Files and folders are transferred in encrypted 64 KiB chunks. Transfers show upload progress, include a SHA-256 checksum, and downloads are written to a `.part` file before being atomically renamed into place. The program does not load a complete file into RAM. The server stores encrypted chunks in a temporary directory and removes them when the room closes. Folder uploads are streamed from a temporary ZIP archive.
 
 The protocol still limits individual control/data frames to 1 MiB, preventing a malformed peer from requesting an unbounded allocation.
 
@@ -35,6 +35,6 @@ Private room messages and file chunks use AES-256-GCM with a fresh nonce per mes
 
 The open-room mode is intentionally public: its shared key is available to every participant. It should not be used for sensitive data. UDP discovery responses are treated only as a room directory; after selection, the TCP connection performs a fresh HMAC challenge-response using the room password before any nickname or chat data is accepted. This prevents a spoofed discovery response or wrong-password client from joining a room.
 
-Hosts also enforce configurable per-file and total room-storage limits (`max_file_size_mb` and `max_room_storage_mb`, with defaults of 2048 MiB and 8192 MiB). Files exceeding either limit are rejected before the server stores them.
+Hosts also enforce configurable per-file and total room-storage limits (`max_file_size_mb` and `max_room_storage_mb`, with defaults of 2048 MiB and 8192 MiB). Files exceeding either limit are rejected before the server stores them. `/who`, `/msg`, `/history`, timestamps, and heartbeat messages are supported in the TCP room.
 
 This is still a local-network application, not a replacement for a mature audited messenger. There are no automated reconnects, certificate-based identity checks, or forward secrecy.

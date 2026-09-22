@@ -1,4 +1,52 @@
-Remaining intentional limitations:
-- Hostless UDP mode is not authenticated and is only suitable for casual LAN use.
-- Private rooms use password authentication rather than certificates or forward secrecy.
-- No artificial total file-size limit is imposed; disk space and OS limits still apply.
+# Future ideas / backlog
+
+Implemented in the current version:
+
+- [x] HMAC challenge-response room authentication.
+- [x] Configurable per-file and total room-storage limits.
+- [x] SHA-256 checksums for transferred files.
+- [x] Atomic client downloads using temporary `.part` files.
+- [x] Upload progress display.
+- [x] Heartbeat messages and idle connection timeouts.
+- [x] Timestamps on room messages.
+- [x] `/who` participant listing.
+- [x] `/msg <nickname> <text>` private messages.
+- [x] `/history` recent room history.
+- [x] Learner documentation in `GUIDE.md`.
+- [x] Tests for the authentication exchange and configuration.
+
+## Remaining security work
+
+- [ ] Add certificate-based server identity verification and optional certificate pinning.
+- [ ] Add a carefully reviewed ephemeral key exchange for forward secrecy.
+- [ ] Replace the shared global-room password design with explicit room invitations or access tokens.
+- [ ] Add an option to require private rooms only and disable open-room mode.
+- [ ] Add secure password guidance and avoid showing sensitive values in logs or errors.
+- [ ] Add rate limits for authentication attempts, messages, and file requests.
+
+## Remaining reliability and transfer work
+
+- [ ] Add automated reconnect with a clear session state.
+- [ ] Add resumable uploads and downloads with chunk offsets.
+- [ ] Add transfer cancellation.
+- [ ] Add safer ZIP extraction with path traversal checks if automatic unpacking is added.
+- [ ] Add a server-side quota reservation so simultaneous uploads cannot exceed room storage.
+
+## Remaining chat and user-experience work
+
+- [ ] Add clearer first-run setup instead of asking many raw questions.
+- [ ] Add command autocomplete and command-specific help.
+- [ ] Add colored message types and optional desktop notifications.
+- [ ] Add configurable and remembered download folders.
+- [ ] Add room-owner controls such as muting, kicking, or banning participants.
+- [ ] Add multiple named rooms on one server.
+- [ ] Add typing indicators or a composing status.
+
+## Remaining architecture and distribution work
+
+- [ ] Add protocol-version negotiation and capability discovery.
+- [ ] Add integration tests using local host/client sockets.
+- [ ] Add structured logging with configurable verbosity.
+- [ ] Split `chat.py` into protocol, crypto, file-transfer, room-state, and UI modules.
+- [ ] Add a graphical interface while keeping the terminal interface.
+- [ ] Package the program as a standalone executable for Windows, macOS, and Linux.

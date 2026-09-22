@@ -7,6 +7,7 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 DISCOVERY_PORT=5001; DISCOVERY_REQUEST=b"CHAT_DISCOVER_V2"; DISCOVERY_PREFIX="CHAT_HERE_V2"
 FRAME_MAX=1024*1024; CHUNK=64*1024; TEXT_MAX=256*1024; SALT_SIZE=16
+PROTOCOL_VERSION=2; SOCKET_TIMEOUT=30; HEARTBEAT_SECONDS=15
 GLOBAL_PORT=52731; GLOBAL_PASSWORD="open-world-chat-fixed"; CONFIG_FILE="config.txt"
 MAX_FILE_SIZE=2*1024*1024*1024
 MAX_ROOM_STORAGE=8*1024*1024*1024
@@ -159,7 +160,7 @@ def config_load(path=CONFIG_FILE):
 
 class Room:
     def __init__(self,max_file_size=MAX_FILE_SIZE,max_storage=MAX_ROOM_STORAGE):
-        self.clients={}; self.files={}; self.next=1; self.max_file_size=max_file_size; self.max_storage=max_storage; self.lock=threading.Lock(); self.file_lock=threading.Lock(); self.stop=threading.Event(); self.tmp=tempfile.mkdtemp(prefix="chat_")
+        self.clients={}; self.files={}; self.history=[]; self.next=1; self.max_file_size=max_file_size; self.max_storage=max_storage; self.lock=threading.Lock(); self.file_lock=threading.Lock(); self.stop=threading.Event(); self.tmp=tempfile.mkdtemp(prefix="chat_")
     def close(self):self.stop.set(); shutil.rmtree(self.tmp,ignore_errors=True)
 def broadcast(room,aes,text,skip=None):
     with room.lock: recipients=[(s,x["send"]) for s,x in room.clients.items() if s is not skip]
@@ -199,17 +200,18 @@ def find_servers(timeout=2):
     return found
 
 def receive_upload(sock,aes,size,path):
-    got=0
+    got=0; digest=hashlib.sha256()
     with open(path,"wb") as out:
         while got<size:
             frame=receive_frame(sock)
             if frame is None:raise ConnectionError("upload interrupted")
             data=dec_chunk(aes,frame)
             if not data or got+len(data)>size:raise ValueError("declared file size does not match data")
-            out.write(struct.pack(">I",len(frame))+frame); got+=len(data)
+            out.write(struct.pack(">I",len(frame))+frame); digest.update(data); got+=len(data)
     if got!=size:raise ValueError("file size mismatch")
+    return digest.hexdigest()
 def send_stored(sock,aes,entry,lock):
-    send_text(sock,aes,json.dumps({"type":"file_begin","name":entry["name"],"size":entry["size"]}),lock)
+    send_text(sock,aes,json.dumps({"type":"file_begin","name":entry["name"],"size":entry["size"],"sha256":entry.get("sha256","")}),lock)
     with open(entry["path"],"rb") as f:
         while True:
             h=f.read(4)
@@ -221,8 +223,11 @@ def send_stored(sock,aes,entry,lock):
             send_frame(sock,b,lock)
     send_text(sock,aes,json.dumps({"type":"file_end"}),lock)
 
+def room_stamp(): return time.strftime("%Y-%m-%d %H:%M:%S")
+def room_message(nick,text): return f"[{room_stamp()}] {nick}: {text}"
 def handler(sock,addr,aes,room,max_members,host):
     send=threading.Lock(); nick=None
+    sock.settimeout(SOCKET_TIMEOUT)
     try:
         raw=receive_frame(sock); nick=decrypt(aes,raw).strip() if raw else ""
         if not 1<=len(nick)<=32 or "|" in nick or "\n" in nick:raise ValueError("invalid nickname")
@@ -230,11 +235,25 @@ def handler(sock,addr,aes,room,max_members,host):
             if max_members is not None and len(room.clients)>=max_members:send_text(sock,aes,"SERVER: Group is full.",send);return
             if nick==host or any(x["nick"]==nick for x in room.clients.values()):send_text(sock,aes,"SERVER: Nickname is taken.",send);return
             room.clients[sock]={"nick":nick,"send":send}
-        send_text(sock,aes,"__NICK_OK__",send); broadcast(room,aes,f"[{nick} joined the group]",sock)
+        send_text(sock,aes,"__NICK_OK__",send); broadcast(room,aes,f"[{room_stamp()}] [{nick} joined the group]",sock)
         while not room.stop.is_set():
-            raw=receive_frame(sock)
+            try: raw=receive_frame(sock)
+            except socket.timeout: raise ConnectionError("client heartbeat timed out")
             if raw is None:break
             text=decrypt(aes,raw)
+            if text=="__PING__":send_text(sock,aes,"__PONG__",send);continue
+            if text=="__WHO__":
+                with room.lock: names=[host]+[x["nick"] for x in room.clients.values()]
+                send_text(sock,aes,"SERVER: Online: "+", ".join(names),send);continue
+            if text=="__HISTORY__":
+                with room.lock: history=list(room.history)
+                send_text(sock,aes,"SERVER: Recent messages:\n"+("\n".join(history) if history else "(none)"),send);continue
+            if text.startswith("__MSG__|"):
+                target_name,message=text[8:].split("|",1) if "|" in text[8:] else ("","")
+                with room.lock: recipient=next(((s,x["send"]) for s,x in room.clients.items() if x["nick"]==target_name),None)
+                if recipient: send_text(recipient[0],aes,f"[private {nick} -> you] {message}",recipient[1])
+                else: send_text(sock,aes,"SERVER: Nickname not found.",send)
+                continue
             if text=="__LIST__":send_text(sock,aes,files_text(room),send);continue
             if text.startswith("__GET__|"):
                 n=text.split("|",1)[1]
@@ -247,15 +266,18 @@ def handler(sock,addr,aes,room,max_members,host):
                 if not isinstance(size,int) or size<0 or size>room.max_file_size:raise ValueError("file exceeds the room file-size limit")
                 with room.file_lock:
                     if sum(x["size"] for x in room.files.values())+size>room.max_storage:raise ValueError("room storage limit reached")
-                p=os.path.join(room.tmp,secrets.token_hex(16)); receive_upload(sock,aes,size,p)
-                with room.file_lock:n=room.next;room.next+=1;room.files[n]={"name":name,"size":size,"from":nick,"path":p}
+                p=os.path.join(room.tmp,secrets.token_hex(16)); digest=receive_upload(sock,aes,size,p)
+                with room.file_lock:n=room.next;room.next+=1;room.files[n]={"name":name,"size":size,"sha256":digest,"from":nick,"path":p}
                 send_text(sock,aes,f"SERVER: File uploaded as number {n}.",send);broadcast(room,aes,f"[New file available: {name} - see /download]",sock);continue
-            broadcast(room,aes,f"{nick}: {text}",sock)
+            with room.lock:
+                room.history.append(room_message(nick,text))
+                room.history=room.history[-100:]
+            broadcast(room,aes,room_message(nick,text),sock)
     except (InvalidTag,ValueError,UnicodeError,json.JSONDecodeError,OSError,ConnectionError):pass
     finally:
         if nick:
             with room.lock:room.clients.pop(sock,None)
-            broadcast(room,aes,f"[{nick} left the group]",sock)
+            broadcast(room,aes,f"[{room_stamp()}] [{nick} left the group]",sock)
         try:sock.close()
         except OSError:pass
 
@@ -263,9 +285,11 @@ def files_text(room):
     with room.file_lock:
         return "SERVER: No files available for download." if not room.files else "SERVER: Available files:\n"+"\n".join(f"[{n}] - {x['name']} ({x['size']} bytes, from {x['from']})" for n,x in sorted(room.files.items()))
 def store_local(aes,source,dest):
+    digest=hashlib.sha256()
     with open(source,"rb") as a,open(dest,"wb") as b:
         while data:=a.read(CHUNK):
-            frame=enc_chunk(aes,data);b.write(struct.pack(">I",len(frame))+frame)
+            digest.update(data); frame=enc_chunk(aes,data);b.write(struct.pack(">I",len(frame))+frame)
+    return digest.hexdigest()
 def server_upload(aes,room,nick,path):
     x=upload_source(path)
     if not x:print(f"[Not found: {path}]");return
@@ -277,7 +301,7 @@ def server_upload(aes,room,nick,path):
             except OSError:pass
         return
     dest=os.path.join(room.tmp,secrets.token_hex(16))
-    try:store_local(aes,source,dest);room.files[room.next]={"name":name,"size":size,"from":nick,"path":dest};room.next+=1;print(f"[Stored {name} ({size} bytes)]");broadcast(room,aes,f"[New file available: {name} - see /download]")
+    try:digest=store_local(aes,source,dest);room.files[room.next]={"name":name,"size":size,"sha256":digest,"from":nick,"path":dest};room.next+=1;print(f"[Stored {name} ({size} bytes)]");broadcast(room,aes,f"[{room_stamp()}] [New file available: {name} - see /download]")
     finally:
         if cleanup:
             try:os.unlink(source)
@@ -302,7 +326,7 @@ def server_download(aes,room,n,d):
     if not es or any(e is None for e in es):print("[Invalid file number]");return
     for e in es:save_file(aes,e,d)
 
-HELP="/upload <path> | /download | /download <n> [folder] | /download -a [folder] | /help | /exit | /quit"
+HELP="/upload <path> | /download | /download <n> [folder] | /download -a [folder] | /who | /msg <nick> <text> | /history | /help | /exit | /quit"
 def run_server():
     c=config_load(); password=c["password"]; kind="global" if not password else "private"; password=password or GLOBAL_PASSWORD
     salt=bytes.fromhex(c["room_salt"]); key=key_from_password(password,salt); nick=c["nickname"] or input("Your nickname: ").strip() or "Server";aes=AESGCM(key);room=Room(c["max_file_size_mb"]*1024*1024,c["max_room_storage_mb"]*1024*1024);server=socket.socket();server.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
@@ -312,7 +336,8 @@ def run_server():
     def accept():
         while not room.stop.is_set():
             s=None
-            try:s,a=server.accept(); authenticate_server(s,key)
+            try:
+                s,a=server.accept(); s.settimeout(10); authenticate_server(s,key)
             except (OSError,ValueError):
                 if s is not None:
                     try:s.close()
@@ -330,9 +355,13 @@ def run_server():
             if line.startswith("/upload "):
                 for p in paths(line[9:]):server_upload(aes,room,nick,p)
             elif line=="/download":print(files_text(room))
+            elif line=="/who":
+                with room.lock:print("Online: "+", ".join([nick]+[x["nick"] for x in room.clients.values()]))
+            elif line=="/history":
+                with room.lock:print("\n".join(room.history[-100:]) or "(none)")
             elif line.startswith("/download "):
                 n,d=download_args(line[10:]);server_download(aes,room,n,d)
-            else:broadcast(room,aes,f"{nick}: {line}")
+            else:broadcast(room,aes,room_message(nick,line))
     except EOFError:pass
     finally:room.close();server.close()
 
@@ -342,16 +371,24 @@ def client_receive(sock,aes,state):
             raw=receive_frame(sock)
             if raw is None:return
             msg=decrypt(aes,raw)
+            if msg=="__PONG__":continue
             if msg.startswith('{"type":"file_begin"'):
-                m=json.loads(msg);size=m["size"]
+                m=json.loads(msg);size=m["size"]; expected_hash=m.get("sha256","")
                 if not isinstance(size,int) or size<0:raise ValueError("bad file size")
-                out=target(m["name"],state["dir"]);got=0
-                with open(out,"wb") as f:
-                    while got<size:
-                        b=receive_frame(sock);data=dec_chunk(aes,b)
-                        if not data or got+len(data)>size:raise ValueError("file size mismatch")
-                        f.write(data);got+=len(data)
-                    if json.loads(decrypt(aes,receive_frame(sock))).get("type")!="file_end":raise ValueError("missing terminator")
+                out=target(m["name"],state["dir"]); temp=out+".part";got=0;digest=hashlib.sha256()
+                try:
+                    with open(temp,"wb") as f:
+                        while got<size:
+                            b=receive_frame(sock);data=dec_chunk(aes,b)
+                            if not data or got+len(data)>size:raise ValueError("file size mismatch")
+                            f.write(data);digest.update(data);got+=len(data)
+                        if json.loads(decrypt(aes,receive_frame(sock))).get("type")!="file_end":raise ValueError("missing terminator")
+                    if expected_hash and not hmac.compare_digest(digest.hexdigest(),expected_hash):raise ValueError("checksum mismatch")
+                    os.replace(temp,out)
+                except Exception:
+                    try:os.unlink(temp)
+                    except OSError:pass
+                    raise
                 print(f"\n[Saved as '{out}']\nYou: ",end="")
             else:print(f"\r{msg}\nYou: ",end="")
     except (InvalidTag,ValueError,UnicodeError,OSError,ConnectionError,TypeError) as e:print(f"\n[Connection closed: {e}]")
@@ -361,9 +398,12 @@ def client_upload(sock,aes,lock,path):
     name,size,source,cleanup=x
     try:
         send_text(sock,aes,"__UPLOAD__|"+json.dumps({"name":name,"size":size}),lock)
+        sent=0
         with open(source,"rb") as f:
-            while data:=f.read(CHUNK):send_frame(sock,enc_chunk(aes,data),lock)
-        print(f"[Uploading {name} ({size} bytes)]")
+            while data:=f.read(CHUNK):
+                send_frame(sock,enc_chunk(aes,data),lock); sent+=len(data)
+                if sent==size or sent%(CHUNK*16)<len(data):print(f"\r[Uploading {name}: {sent}/{size} bytes]",end="",flush=True)
+        print()
     finally:
         if cleanup:
             try:os.unlink(source)
@@ -384,7 +424,12 @@ def run_client():
         sock=socket.create_connection((ip,port),10); authenticate_client(sock,key_from_password(password,salt)); client_config=config_load(); send_text(sock,aes,client_config["nickname"] or input("Nickname: ").strip() or "Guest",lock);reply=receive_frame(sock)
         if decrypt(aes,reply)!="__NICK_OK__":print(decrypt(aes,reply));sock.close();return
     except (OSError,InvalidTag,ValueError,UnicodeError) as e:print(f"[Connection failed: {e}]");return
-    state={"dir":"."}; clear_terminal(); print(f"Connected to {ip}:{port}. File and message history starts here."); threading.Thread(target=client_receive,args=(sock,aes,state),daemon=True).start()
+    state={"dir":".","stop":threading.Event()}; clear_terminal(); print(f"Connected to {ip}:{port}. File and message history starts here."); threading.Thread(target=client_receive,args=(sock,aes,state),daemon=True).start()
+    def heartbeat():
+        while not state["stop"].wait(HEARTBEAT_SECONDS):
+            try:send_text(sock,aes,"__PING__",lock)
+            except OSError:return
+    threading.Thread(target=heartbeat,daemon=True).start()
     try:
         while True:
             line=input("You: ")
@@ -393,12 +438,19 @@ def run_client():
             if line=="/help":print(HELP);continue
             if line.startswith("/upload "):
                 for p in paths(line[9:]):client_upload(sock,aes,lock,p)
+            elif line=="/who":send_text(sock,aes,"__WHO__",lock)
+            elif line.startswith("/msg "):
+                parts=line[5:].split(None,1)
+                if len(parts)==2:send_text(sock,aes,"__MSG__|"+parts[0]+"|"+parts[1],lock)
+                else:print("Usage: /msg <nickname> <message>")
             elif line=="/download":send_text(sock,aes,"__LIST__",lock)
             elif line.startswith("/download "):
                 n,d=download_args(line[10:]);state["dir"]=d;send_text(sock,aes,"__GET__|"+n,lock)
+            elif line=="/history":send_text(sock,aes,"__HISTORY__",lock)
             else:send_text(sock,aes,line,lock)
     except (EOFError,OSError):pass
     finally:
+        state["stop"].set()
         try:sock.shutdown(socket.SHUT_RDWR)
         except OSError:pass
         sock.close()
