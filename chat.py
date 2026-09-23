@@ -130,6 +130,11 @@ def paths(raw):
     if ";" in raw:return [clean_path(x) for x in raw.split(";") if clean_path(x)]
     p=[clean_path(x) for x in raw.split() if clean_path(x)]
     return p if len(p)>1 and all(os.path.exists(x) for x in p) else [clean_path(raw)]
+def ask_port(default=5000):
+    raw=input(f"Port [{default}]: ").strip()
+    try:return int(raw) if raw else default
+    except ValueError:
+        print(f"[Invalid port, using {default}]");return default
 def download_args(raw):
     try:
         lx=shlex.shlex(raw.strip(),posix=False); lx.whitespace_split=True; p=[clean_path(x) for x in lx]
@@ -255,7 +260,7 @@ def send_stored(sock,aes,entry,lock):
 def room_stamp(): return time.strftime("%Y-%m-%d %H:%M:%S")
 def room_message(nick,text): return f"[{room_stamp()}] {nick}: {text}"
 def handler(sock,addr,aes,room,max_members,host):
-    send=threading.Lock(); nick=None
+    send=threading.Lock(); nick=None; in_room=False
     sock.settimeout(SOCKET_TIMEOUT)
     try:
         raw=receive_frame(sock); nick=decrypt(aes,raw).strip() if raw else ""
@@ -265,6 +270,7 @@ def handler(sock,addr,aes,room,max_members,host):
             if max_members is not None and len(room.clients)>=max_members:send_text(sock,aes,"SERVER: Group is full.",send);return
             if nick==host or any(x["nick"]==nick for x in room.clients.values()):send_text(sock,aes,"SERVER: Nickname is taken.",send);return
             room.clients[sock]={"nick":nick,"send":send}
+        in_room=True
         joined=f"[{room_stamp()}] [{nick} joined the group]"
         send_text(sock,aes,"__NICK_OK__",send); broadcast(room,aes,joined,sock)
         print(f"\r{colorize(joined,'system')}\nYou: ",end="",flush=True)
@@ -280,31 +286,45 @@ def handler(sock,addr,aes,room,max_members,host):
             if text=="__HISTORY__":
                 with room.lock: history=list(room.history)
                 send_text(sock,aes,"SERVER: Recent messages:\n"+("\n".join(history) if history else "(none)"),send);continue
+            if nick in room.muted:
+                send_text(sock,aes,"SERVER: You are muted.",send);continue
             if text.startswith("__TYPING__|"):
                 status=text.split("|",1)[1]
-                broadcast(room,aes,f"[typing] {nick} {'is typing' if status=='on' else 'stopped typing'}",sock);continue
+                line_out=f"[typing] {nick} {'is typing' if status=='on' else 'stopped typing'}"
+                broadcast(room,aes,line_out,sock)
+                print(f"\r{colorize(line_out,'system')}\nYou: ",end="",flush=True);continue
             if text.startswith("__MOD__|"):
                 action,target_name=text[8:].split("|",1) if "|" in text[8:] else ("","")
                 if nick!=host:send_text(sock,aes,"SERVER: Only the host can moderate the room.",send);continue
                 with room.lock:
                     target_socket=next((s for s,x in room.clients.items() if x["nick"]==target_name),None)
+                    target_lock=room.clients[target_socket]["send"] if target_socket else None
                     if action=="ban":room.banned.add(target_name)
                     elif action=="unban":room.banned.discard(target_name)
                     elif action=="mute":room.muted.add(target_name)
                     elif action=="unmute":room.muted.discard(target_name)
                 if action in ("kick","ban") and target_socket:
                     label="kicked" if action=="kick" else "banned"
-                    send_text(target_socket,aes,f"SERVER: You were {label} by the host.",room.clients[target_socket]["send"])
+                    try:send_text(target_socket,aes,f"SERVER: You were {label} by the host.",target_lock)
+                    except (OSError,ValueError):pass
                     try:target_socket.shutdown(socket.SHUT_RDWR)
                     except OSError:pass
+                    with room.lock:room.clients.pop(target_socket,None)
                 send_text(sock,aes,f"SERVER: {action} applied to {target_name}.",send);continue
-            if nick in room.muted:
-                send_text(sock,aes,"SERVER: You are muted.",send);continue
             if text.startswith("__MSG__|"):
                 target_name,message=text[8:].split("|",1) if "|" in text[8:] else ("","")
-                with room.lock: recipient=next(((s,x["send"]) for s,x in room.clients.items() if x["nick"]==target_name),None)
-                if recipient: send_text(recipient[0],aes,f"[private {nick} -> you] {message}",recipient[1])
-                else: send_text(sock,aes,"SERVER: Nickname not found.",send)
+                if not target_name or not message:
+                    send_text(sock,aes,"SERVER: Usage: /msg <nickname> <text>",send);continue
+                if target_name==host:
+                    private_line=f"[private {nick} -> you] {message}"
+                    print(f"\r{colorize(private_line,'private')}\nYou: ",end="",flush=True);notify()
+                    send_text(sock,aes,f"[private you -> {target_name}] {message}",send)
+                else:
+                    with room.lock: recipient=next(((s,x["send"]) for s,x in room.clients.items() if x["nick"]==target_name),None)
+                    if recipient:
+                        send_text(recipient[0],aes,f"[private {nick} -> you] {message}",recipient[1])
+                        send_text(sock,aes,f"[private you -> {target_name}] {message}",send)
+                    else: send_text(sock,aes,"SERVER: Nickname not found.",send)
                 continue
             if text=="__LIST__":send_text(sock,aes,files_text(room),send);continue
             if text.startswith("__GET__|"):
@@ -329,7 +349,7 @@ def handler(sock,addr,aes,room,max_members,host):
             print(f"\r{colorize(message,'message')}\nYou: ",end="",flush=True)
     except (InvalidTag,ValueError,UnicodeError,json.JSONDecodeError,OSError,ConnectionError):pass
     finally:
-        if nick:
+        if in_room:
             with room.lock:room.clients.pop(sock,None)
             left=f"[{room_stamp()}] [{nick} left the group]"
             broadcast(room,aes,left,sock)
@@ -382,6 +402,49 @@ def server_download(aes,room,n,d):
     if not es or any(e is None for e in es):print("[Invalid file number]");return
     for e in es:save_file(aes,e,d)
 
+def parse_command(line):
+    """Classify one typed line so the host and client loops behave identically."""
+    if line in ("/quit","/exit"):return line[1:],""
+    if line=="/help":return "help",""
+    if line.startswith("/upload "):return "upload",line[9:].strip()
+    if line=="/upload":return "usage","/upload <path>"
+    if line=="/download":return "download_list",""
+    if line.startswith("/download "):return "download",line[10:].strip()
+    if line=="/who":return "who",""
+    if line=="/history":return "history",""
+    if line.startswith("/typing "):
+        arg=line.split(None,1)[1].strip().lower()
+        return ("typing",arg) if arg in ("on","off") else ("usage","/typing on|off")
+    if line=="/msg":return "usage","/msg <nickname> <text>"
+    if line.startswith("/msg "):
+        parts=line[5:].strip().split(None,1)
+        return ("msg",(parts[0],parts[1])) if len(parts)==2 else ("usage","/msg <nickname> <text>")
+    for cmd in ("kick","ban","unban","mute","unmute"):
+        if line.startswith("/"+cmd+" "):return cmd,line[len(cmd)+2:].strip()
+    return "say",line
+
+def host_private(room,aes,host_nick,target,message):
+    with room.lock:recipient=next(((s,x["send"]) for s,x in room.clients.items() if x["nick"]==target),None)
+    if not recipient:print(f"[No participant named {target}]");return
+    send_text(recipient[0],aes,f"[private {host_nick} -> you] {message}",recipient[1])
+    print(colorize(f"[private you -> {target}] {message}","private"))
+
+def host_moderate(room,aes,target,action):
+    with room.lock:
+        ts=next((s for s,x in room.clients.items() if x["nick"]==target),None); tlock=room.clients[ts]["send"] if ts else None
+        if action=="ban":room.banned.add(target)
+        elif action=="unban":room.banned.discard(target)
+        elif action=="mute":room.muted.add(target)
+        elif action=="unmute":room.muted.discard(target)
+    if action in ("kick","ban") and ts:
+        label="kicked" if action=="kick" else "banned"
+        try:send_text(ts,aes,f"SERVER: You were {label} by the host.",tlock)
+        except (OSError,ValueError):pass
+        try:ts.shutdown(socket.SHUT_RDWR)
+        except OSError:pass
+        with room.lock:room.clients.pop(ts,None)
+    print(f"[{action} applied to {target}]")
+
 HELP="/upload <path> | /download [n] [folder] | /who | /msg <nick> <text> | /history | /typing on|off | /kick /ban /unban /mute /unmute <nick> | /help | /exit | /quit"
 def run_server():
     first_run=not os.path.exists(CONFIG_FILE); c=config_load()
@@ -411,20 +474,31 @@ def run_server():
     threading.Thread(target=accept,daemon=True).start(); clear_terminal(); setup_completion(); print(f"Room running on {c['port']}. Commands: {HELP}")
     try:
         while True:
-            line=input("You: ")
-            if line=="/quit":raise QuitProgram()
-            if line=="/exit":break
-            if line=="/help":print(HELP);continue
-            if line.startswith("/upload "):
-                for p in paths(line[9:]):server_upload(aes,room,nick,p)
-            elif line=="/download":print(files_text(room))
-            elif line=="/who":
+            try:line=input("You: ")
+            except EOFError:break
+            action,arg=parse_command(line)
+            if action=="quit":raise QuitProgram()
+            if action=="exit":break
+            if action=="help":print(HELP);continue
+            if action=="usage":print(arg);continue
+            if action=="upload":
+                for p in paths(arg):server_upload(aes,room,nick,p)
+            elif action=="download_list":print(files_text(room))
+            elif action=="who":
                 with room.lock:print("Online: "+", ".join([nick]+[x["nick"] for x in room.clients.values()]))
-            elif line=="/history":
+            elif action=="history":
                 with room.lock:print("\n".join(room.history[-100:]) or "(none)")
-            elif line.startswith("/download "):
-                n,d=download_args(line[10:]);server_download(aes,room,n,d)
-            else:broadcast(room,aes,room_message(nick,line))
+            elif action=="download":
+                n,d=download_args(arg);server_download(aes,room,n,d)
+            elif action=="typing":
+                broadcast(room,aes,f"[typing] {nick} {'is typing' if arg=='on' else 'stopped typing'}")
+            elif action=="msg":host_private(room,aes,nick,arg[0],arg[1])
+            elif action in ("kick","ban","unban","mute","unmute"):host_moderate(room,aes,arg,action)
+            else:
+                msg=room_message(nick,line)
+                with room.lock:
+                    room.history.append(msg);room.history=room.history[-100:]
+                broadcast(room,aes,msg)
     except EOFError:pass
     finally:room.close();server.close()
 
@@ -482,8 +556,8 @@ def run_client():
         for i,x in enumerate(found,1):print(i,x[1],x[0],x[2],x[3])
         ch=input("Server number (Enter=manual): ").strip()
         if ch.isdigit() and 1<=int(ch)<=len(found):ip,_r,port,kind,shex=found[int(ch)-1]
-        else:ip=input("IP: ").strip() or "127.0.0.1";port=int(input("Port [5000]: ") or 5000);kind="private";shex=input("Room salt hex: ")
-    else:ip=input("IP: ").strip() or "127.0.0.1";port=int(input("Port [5000]: ") or 5000);kind="private";shex=input("Room salt hex: ")
+        else:ip=input("IP: ").strip() or "127.0.0.1";port=ask_port();kind="private";shex=input("Room salt hex: ")
+    else:ip=input("IP: ").strip() or "127.0.0.1";port=ask_port();kind="private";shex=input("Room salt hex: ")
     try:salt=bytes.fromhex(shex);password=GLOBAL_PASSWORD if kind=="global" else input("Room password: ");key=key_from_password(password,salt);aes=AESGCM(key)
     except ValueError:print("[Invalid salt]");return
     lock=threading.Lock();sock=None; client_config=config_load()
@@ -499,28 +573,23 @@ def run_client():
     threading.Thread(target=heartbeat,daemon=True).start()
     try:
         while True:
-            line=input("You: ")
-            if line=="/quit":raise QuitProgram()
-            if line=="/exit":break
-            if line=="/help":print(HELP);continue
-            if line.startswith("/upload "):
-                for p in paths(line[9:]):client_upload(sock,aes,lock,p)
-            elif line=="/who":send_text(sock,aes,"__WHO__",lock)
-            elif line in ("/typing on","/typing off"):
-                send_text(sock,aes,"__TYPING__|"+line.rsplit(None,1)[1],lock)
-            elif line.startswith("/kick "):send_text(sock,aes,"__MOD__|kick|"+line[6:].strip(),lock)
-            elif line.startswith("/ban "):send_text(sock,aes,"__MOD__|ban|"+line[5:].strip(),lock)
-            elif line.startswith("/unban "):send_text(sock,aes,"__MOD__|unban|"+line[7:].strip(),lock)
-            elif line.startswith("/mute "):send_text(sock,aes,"__MOD__|mute|"+line[6:].strip(),lock)
-            elif line.startswith("/unmute "):send_text(sock,aes,"__MOD__|unmute|"+line[8:].strip(),lock)
-            elif line.startswith("/msg "):
-                parts=line[5:].split(None,1)
-                if len(parts)==2:send_text(sock,aes,"__MSG__|"+parts[0]+"|"+parts[1],lock)
-                else:print("Usage: /msg <nickname> <message>")
-            elif line=="/download":send_text(sock,aes,"__LIST__",lock)
-            elif line.startswith("/download "):
-                n,d=download_args(line[10:]);state["dir"]=d;client_config["download_dir"]=d;config_save(client_config);send_text(sock,aes,"__GET__|"+n,lock)
-            elif line=="/history":send_text(sock,aes,"__HISTORY__",lock)
+            try:line=input("You: ")
+            except EOFError:break
+            action,arg=parse_command(line)
+            if action=="quit":raise QuitProgram()
+            if action=="exit":break
+            if action=="help":print(HELP);continue
+            if action=="usage":print(arg);continue
+            if action=="upload":
+                for p in paths(arg):client_upload(sock,aes,lock,p)
+            elif action=="download_list":send_text(sock,aes,"__LIST__",lock)
+            elif action=="who":send_text(sock,aes,"__WHO__",lock)
+            elif action=="history":send_text(sock,aes,"__HISTORY__",lock)
+            elif action=="typing":send_text(sock,aes,"__TYPING__|"+arg,lock)
+            elif action=="msg":send_text(sock,aes,"__MSG__|"+arg[0]+"|"+arg[1],lock)
+            elif action in ("kick","ban","unban","mute","unmute"):send_text(sock,aes,"__MOD__|"+action+"|"+arg,lock)
+            elif action=="download":
+                n,d=download_args(arg);state["dir"]=d;client_config["download_dir"]=d;config_save(client_config);send_text(sock,aes,"__GET__|"+n,lock)
             else:send_text(sock,aes,line,lock)
     except (EOFError,OSError):pass
     finally:
@@ -543,7 +612,7 @@ def run_global():
         while True:
             try:data,_=sock.recvfrom(FRAME_MAX); sender,msg=decrypt(aes,data).split("|",1)
             except (OSError,InvalidTag,ValueError,UnicodeError):return
-            if sender!=own:print(f"\\r{msg}\\nYou: ",end="")
+            if sender!=own:print(f"\r{msg}\nYou: ",end="",flush=True)
     threading.Thread(target=listen,daemon=True).start(); clear_terminal(); print("Global room started. Messages will remain visible until you leave.")
     try:
         while True:

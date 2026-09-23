@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 import unittest
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -50,6 +51,36 @@ class ChatHelpersTests(unittest.TestCase):
         self.assertEqual(chat.message_kind("[Alice joined the group]"), "system")
         self.assertEqual(chat.message_kind("[private Alice -> you] hi"), "private")
 
+    def test_every_advertised_command_is_recognized(self):
+        samples = {
+            "/upload x": "upload",
+            "/download": "download_list",
+            "/download 1 ./d": "download",
+            "/who": "who",
+            "/msg Alice hi": "msg",
+            "/history": "history",
+            "/typing on": "typing",
+            "/typing off": "typing",
+            "/kick Alice": "kick",
+            "/ban Alice": "ban",
+            "/unban Alice": "unban",
+            "/mute Alice": "mute",
+            "/unmute Alice": "unmute",
+            "/help": "help",
+            "/exit": "exit",
+            "/quit": "quit",
+        }
+        for line, expected in samples.items():
+            self.assertEqual(chat.parse_command(line)[0], expected, line)
+
+    def test_private_message_parsing_keeps_target_and_text(self):
+        self.assertEqual(chat.parse_command("/msg Alice hello there")[1], ("Alice", "hello there"))
+        self.assertEqual(chat.parse_command("/msg")[0], "usage")
+        self.assertEqual(chat.parse_command("/typing maybe")[0], "usage")
+
+    def test_normal_chat_line_is_not_a_command(self):
+        self.assertEqual(chat.parse_command("hello /who")[0], "say")
+
     def test_authentication_challenge_round_trip(self):
         import socket
         key = os.urandom(32)
@@ -66,6 +97,58 @@ class ChatHelpersTests(unittest.TestCase):
         finally:
             left.close()
             right.close()
+
+
+class ChatIntegrationTests(unittest.TestCase):
+    """End-to-end check over a real socket that private messages and typing work."""
+
+    def _serve(self, server, key, aes, room, captured):
+        try:
+            client, _ = server.accept()
+            try:
+                chat.authenticate_server(client, key)
+                chat.handler(client, None, aes, room, 10, "Server")
+            finally:
+                client.close()
+        except OSError:
+            pass
+
+    def test_private_message_and_typing_round_trip(self):
+        import contextlib
+        import io
+        import socket
+        import threading
+
+        key = os.urandom(32)
+        aes = AESGCM(key)
+        room = chat.Room()
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            thread = threading.Thread(target=self._serve, args=(server, key, aes, room, captured), daemon=True)
+            thread.start()
+            client = socket.create_connection(("127.0.0.1", port), 5)
+            client.settimeout(5)
+            try:
+                chat.authenticate_client(client, key)
+                chat.send_text(client, aes, "Bob")
+                self.assertEqual(chat.decrypt(aes, chat.receive_frame(client)), "__NICK_OK__")
+                chat.send_text(client, aes, "__MSG__|Server|hello host")
+                self.assertEqual(chat.decrypt(aes, chat.receive_frame(client)), "[private you -> Server] hello host")
+                chat.send_text(client, aes, "__TYPING__|on")
+                time.sleep(0.2)
+            finally:
+                client.close()
+            thread.join(timeout=3)
+        output = captured.getvalue()
+        self.assertIn("[private Bob -> you] hello host", output)
+        self.assertIn("[typing] Bob is typing", output)
+        room.close()
+        server.close()
 
 
 if __name__ == "__main__":
