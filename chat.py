@@ -233,6 +233,22 @@ def find_servers(timeout=2):
     finally:s.close()
     return found
 
+def upload_header_size(text):
+    """Plaintext byte count announced by an __UPLOAD__ control line, or None."""
+    try:size=json.loads(text[11:]).get("size")
+    except (json.JSONDecodeError,ValueError,AttributeError):return None
+    return size if isinstance(size,int) and size>=0 else None
+def discard_upload(sock,aes,size,cap=64*1024*1024):
+    """Drain an unwanted upload stream so the session stays usable; False if undrained."""
+    got=0
+    while got<size and got<cap:
+        frame=receive_frame(sock)
+        if frame is None:return False
+        data=dec_chunk(aes,frame)
+        if not data:return False
+        got+=len(data)
+    return got>=size
+
 def receive_upload(sock,aes,size,path):
     got=0; digest=hashlib.sha256()
     with open(path,"wb") as out:
@@ -286,8 +302,6 @@ def handler(sock,addr,aes,room,max_members,host):
             if text=="__HISTORY__":
                 with room.lock: history=list(room.history)
                 send_text(sock,aes,"SERVER: Recent messages:\n"+("\n".join(history) if history else "(none)"),send);continue
-            if nick in room.muted:
-                send_text(sock,aes,"SERVER: You are muted.",send);continue
             if text.startswith("__TYPING__|"):
                 status=text.split("|",1)[1]
                 line_out=f"[typing] {nick} {'is typing' if status=='on' else 'stopped typing'}"
@@ -298,7 +312,7 @@ def handler(sock,addr,aes,room,max_members,host):
                 if nick!=host:send_text(sock,aes,"SERVER: Only the host can moderate the room.",send);continue
                 with room.lock:
                     target_socket=next((s for s,x in room.clients.items() if x["nick"]==target_name),None)
-                    target_lock=room.clients[target_socket]["send"] if target_socket else None
+                    target_lock=room.clients.get(target_socket,{}).get("send") if target_socket else None
                     if action=="ban":room.banned.add(target_name)
                     elif action=="unban":room.banned.discard(target_name)
                     elif action=="mute":room.muted.add(target_name)
@@ -333,14 +347,27 @@ def handler(sock,addr,aes,room,max_members,host):
                 if not entries or any(x is None for x in entries):send_text(sock,aes,"SERVER: Invalid file number.",send);continue
                 for e in entries:send_stored(sock,aes,e,send)
                 continue
+            if nick in room.muted:
+                if text.startswith("__UPLOAD__|"):
+                    rejected=upload_header_size(text)
+                    if rejected is not None:discard_upload(sock,aes,rejected)
+                send_text(sock,aes,"SERVER: You are muted.",send);continue
             if text.startswith("__UPLOAD__|"):
-                m=json.loads(text[11:]); name=safe_name(m.get("name")); size=m.get("size")
-                if not isinstance(size,int) or size<0 or size>room.max_file_size:raise ValueError("file exceeds the room file-size limit")
+                try:m=json.loads(text[11:])
+                except json.JSONDecodeError:raise ConnectionError("malformed upload header")
+                name=safe_name(m.get("name")); size=m.get("size")
+                if not isinstance(size,int) or size<0:raise ConnectionError("malformed upload header")
                 with room.file_lock:
-                    if sum(x["size"] for x in room.files.values())+size>room.max_storage:raise ValueError("room storage limit reached")
+                    exceeds=size>room.max_file_size or sum(x["size"] for x in room.files.values())+size>room.max_storage
+                if exceeds:
+                    discard_upload(sock,aes,size)
+                    send_text(sock,aes,f"SERVER: Upload rejected: at most {room.max_file_size//(1024*1024)} MiB per file and {room.max_storage//(1024*1024)} MiB in total per room.",send);continue
                 p=os.path.join(room.tmp,secrets.token_hex(16)); digest=receive_upload(sock,aes,size,p)
-                with room.file_lock:n=room.next;room.next+=1;room.files[n]={"name":name,"size":size,"sha256":digest,"from":nick,"path":p}
+                with room.file_lock:
+                    n=room.next;room.next+=1;room.files[n]={"name":name,"size":size,"sha256":digest,"from":nick,"path":p}
                 send_text(sock,aes,f"SERVER: File uploaded as number {n}.",send);broadcast(room,aes,f"[New file available: {name} - see /download]",sock);continue
+            if text.startswith("__SAY__|"):text=text[8:]
+            if not text.strip():continue
             message=room_message(nick,text)
             with room.lock:
                 room.history.append(message)
@@ -370,14 +397,17 @@ def server_upload(aes,room,nick,path):
     x=upload_source(path)
     if not x:print(f"[Not found: {path}]");return
     name,size,source,cleanup=x
-    if size>room.max_file_size or sum(e["size"] for e in room.files.values())+size>room.max_storage:
-        print("[File rejected: room file-size or storage limit exceeded]");
-        if cleanup:
-            try:os.unlink(source)
-            except OSError:pass
-        return
-    dest=os.path.join(room.tmp,secrets.token_hex(16))
-    try:digest=store_local(aes,source,dest);room.files[room.next]={"name":name,"size":size,"sha256":digest,"from":nick,"path":dest};room.next+=1;print(f"[Stored {name} ({size} bytes)]");broadcast(room,aes,f"[{room_stamp()}] [New file available: {name} - see /download]")
+    try:
+        with room.file_lock:
+            exceeds=size>room.max_file_size or sum(e["size"] for e in room.files.values())+size>room.max_storage
+        if exceeds:
+            print("[File rejected: room file-size or storage limit exceeded]")
+            return
+        dest=os.path.join(room.tmp,secrets.token_hex(16))
+        digest=store_local(aes,source,dest)
+        with room.file_lock:
+            room.files[room.next]={"name":name,"size":size,"sha256":digest,"from":nick,"path":dest};room.next+=1
+        print(f"[Stored {name} ({size} bytes)]");broadcast(room,aes,f"[{room_stamp()}] [New file available: {name} - see /download]")
     finally:
         if cleanup:
             try:os.unlink(source)
@@ -401,27 +431,35 @@ def server_download(aes,room,n,d):
     with room.file_lock:es=list(room.files.values()) if n=="-a" else [room.files.get(int(n))] if n.isdigit() else []
     if not es or any(e is None for e in es):print("[Invalid file number]");return
     for e in es:save_file(aes,e,d)
-
+MOD_COMMANDS=("kick","ban","unban","mute","unmute")
 def parse_command(line):
     """Classify one typed line so the host and client loops behave identically."""
-    if line in ("/quit","/exit"):return line[1:],""
-    if line=="/help":return "help",""
-    if line.startswith("/upload "):return "upload",line[9:].strip()
-    if line=="/upload":return "usage","/upload <path>"
-    if line=="/download":return "download_list",""
-    if line.startswith("/download "):return "download",line[10:].strip()
-    if line=="/who":return "who",""
-    if line=="/history":return "history",""
-    if line.startswith("/typing "):
-        arg=line.split(None,1)[1].strip().lower()
+    raw=str(line).strip()
+    if not raw:return "empty",""
+    if raw in ("/quit","/exit"):return raw[1:],""
+    if raw=="/help":return "help",""
+    if raw=="/upload":return "usage","/upload <path> [path ...]"
+    if raw.startswith("/upload "):return "upload",raw[len("/upload "):].strip()
+    if raw=="/download":return "download_list",""
+    if raw.startswith("/download "):
+        arg=raw[len("/download "):].strip()
+        return ("download",arg) if arg else ("download_list","")
+    if raw=="/who":return "who",""
+    if raw=="/history":return "history",""
+    if raw=="/typing":return "usage","/typing on|off"
+    if raw.startswith("/typing "):
+        arg=raw.split(None,1)[1].strip().lower()
         return ("typing",arg) if arg in ("on","off") else ("usage","/typing on|off")
-    if line=="/msg":return "usage","/msg <nickname> <text>"
-    if line.startswith("/msg "):
-        parts=line[5:].strip().split(None,1)
-        return ("msg",(parts[0],parts[1])) if len(parts)==2 else ("usage","/msg <nickname> <text>")
-    for cmd in ("kick","ban","unban","mute","unmute"):
-        if line.startswith("/"+cmd+" "):return cmd,line[len(cmd)+2:].strip()
-    return "say",line
+    if raw=="/msg":return "usage","/msg <nickname> <text>"
+    if raw.startswith("/msg "):
+        parts=raw.split(None,2)
+        if len(parts)==3 and parts[2].strip():return "msg",(parts[1],parts[2].strip())
+        return "usage","/msg <nickname> <text>"
+    head=raw.split(None,1)
+    if head[0].startswith("/") and head[0][1:].lower() in MOD_COMMANDS:
+        return (head[0][1:].lower(),head[1].strip()) if len(head)==2 and head[1].strip() else ("usage",head[0]+" <nickname>")
+    if raw.startswith("/") and len(head)==1:return "unknown",raw
+    return "say",raw
 
 def host_private(room,aes,host_nick,target,message):
     with room.lock:recipient=next(((s,x["send"]) for s,x in room.clients.items() if x["nick"]==target),None)
@@ -431,7 +469,7 @@ def host_private(room,aes,host_nick,target,message):
 
 def host_moderate(room,aes,target,action):
     with room.lock:
-        ts=next((s for s,x in room.clients.items() if x["nick"]==target),None); tlock=room.clients[ts]["send"] if ts else None
+        ts=next((s for s,x in room.clients.items() if x["nick"]==target),None); tlock=room.clients.get(ts,{}).get("send") if ts else None
         if action=="ban":room.banned.add(target)
         elif action=="unban":room.banned.discard(target)
         elif action=="mute":room.muted.add(target)
@@ -443,9 +481,9 @@ def host_moderate(room,aes,target,action):
         try:ts.shutdown(socket.SHUT_RDWR)
         except OSError:pass
         with room.lock:room.clients.pop(ts,None)
-    print(f"[{action} applied to {target}]")
+    print(colorize(f"[{action} applied to {target}]","system"))
 
-HELP="/upload <path> | /download [n] [folder] | /who | /msg <nick> <text> | /history | /typing on|off | /kick /ban /unban /mute /unmute <nick> | /help | /exit | /quit"
+HELP="/upload <path> [path ...] | /download [n|-a] [folder] | /who | /msg <nick> <text> | /history | /typing on|off | /kick /ban /unban /mute /unmute <nick> | /help | /exit | /quit"
 def run_server():
     first_run=not os.path.exists(CONFIG_FILE); c=config_load()
     if first_run:
@@ -456,22 +494,37 @@ def run_server():
         config_save(c)
     password=c["password"]; kind="global" if not password else "private"; password=password or GLOBAL_PASSWORD
     salt=bytes.fromhex(c["room_salt"]); key=key_from_password(password,salt); nick=c["nickname"] or input("Your nickname: ").strip() or "Server";aes=AESGCM(key);room=Room(c["max_file_size_mb"]*1024*1024,c["max_room_storage_mb"]*1024*1024);server=socket.socket();server.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
-    try:server.bind(("",c["port"]));server.listen(20)
+    try:server.bind(("",c["port"]));server.listen(20);server.settimeout(1)
     except OSError as e:print(e);room.close();return
     threading.Thread(target=discovery,args=(c["room_name"] or "Chat-Room",c["port"],kind,c["room_salt"],room.stop),daemon=True).start()
+    workers=[]
     def accept():
         while not room.stop.is_set():
             s=None
             try:
                 s,a=server.accept(); s.settimeout(10); authenticate_server(s,key)
+            except socket.timeout:continue
             except (OSError,ValueError):
                 if s is not None:
                     try:s.close()
                     except OSError:pass
                 if room.stop.is_set():break
                 continue
-            threading.Thread(target=handler,args=(s,a,aes,room,None if kind=="global" else c["max_members"],nick),daemon=True).start()
-    threading.Thread(target=accept,daemon=True).start(); clear_terminal(); setup_completion(); print(f"Room running on {c['port']}. Commands: {HELP}")
+            t=threading.Thread(target=handler,args=(s,a,aes,room,None if kind=="global" else c["max_members"],nick),daemon=True); workers.append(t); t.start()
+    accept_thread=threading.Thread(target=accept,daemon=True); accept_thread.start()
+    def shutdown_room():
+        """Wake and join every helper thread so the process can exit cleanly."""
+        room.close()
+        try:server.close()
+        except OSError:pass
+        with room.lock:open_sockets=list(room.clients)
+        for s in open_sockets:
+            try:s.shutdown(socket.SHUT_RDWR)
+            except OSError:pass
+        for t in list(workers):
+            if t.is_alive():t.join(timeout=2)
+        if accept_thread.is_alive():accept_thread.join(timeout=2)
+    clear_terminal(); setup_completion(); print(f"Room running on {c['port']}. Commands: {HELP}")
     try:
         while True:
             try:line=input("You: ")
@@ -479,8 +532,11 @@ def run_server():
             action,arg=parse_command(line)
             if action=="quit":raise QuitProgram()
             if action=="exit":break
-            if action=="help":print(HELP);continue
-            if action=="usage":print(arg);continue
+            if action in ("help","empty"):
+                if action=="help":print(HELP)
+                continue
+            if action=="usage":print(f"[Usage: {arg}]") if arg else print("[Usage: see /help]");continue
+            if action=="unknown":print(f"[Unknown command: {arg}] Type /help to see every command.");continue
             if action=="upload":
                 for p in paths(arg):server_upload(aes,room,nick,p)
             elif action=="download_list":print(files_text(room))
@@ -500,18 +556,21 @@ def run_server():
                     room.history.append(msg);room.history=room.history[-100:]
                 broadcast(room,aes,msg)
     except EOFError:pass
-    finally:room.close();server.close()
+    finally:shutdown_room()
 
 def client_receive(sock,aes,state):
     try:
         while True:
             raw=receive_frame(sock)
-            if raw is None:return
+            if raw is None:
+                if not state["stop"].is_set():
+                    state["stop"].set(); print("\n[The room closed the connection.]",flush=True)
+                return
             msg=decrypt(aes,raw)
             if msg=="__PONG__":continue
             if msg.startswith('{"type":"file_begin"'):
                 m=json.loads(msg);size=m["size"]; expected_hash=m.get("sha256","")
-                if not isinstance(size,int) or size<0:raise ValueError("bad file size")
+                if not isinstance(size,int) or size<0 or size>MAX_FILE_SIZE:raise ValueError("bad file size")
                 out=target(m["name"],state["dir"]); temp=out+".part";got=0;digest=hashlib.sha256()
                 try:
                     with open(temp,"wb") as f:
@@ -532,7 +591,9 @@ def client_receive(sock,aes,state):
                 kind=message_kind(msg)
                 print(f"\r{colorize(msg,kind)}\nYou: ",end="")
                 if not msg.startswith("[typing]"):notify()
-    except (InvalidTag,ValueError,UnicodeError,OSError,ConnectionError,TypeError) as e:print(f"\n[Connection closed: {e}]")
+    except (InvalidTag,ValueError,UnicodeError,OSError,ConnectionError,TypeError) as e:
+        if not state["stop"].is_set():
+            state["stop"].set(); print(f"\n[Connection closed: {e}]",flush=True)
 def client_upload(sock,aes,lock,path):
     x=upload_source(path)
     if not x:print(f"[Not found: {path}]");return
@@ -545,6 +606,7 @@ def client_upload(sock,aes,lock,path):
                 send_frame(sock,enc_chunk(aes,data),lock); sent+=len(data)
                 if sent==size or sent%(CHUNK*16)<len(data):print(f"\r[Uploading {name}: {sent}/{size} bytes]",end="",flush=True)
         print()
+    except OSError as e:print(f"\n[Upload aborted: {e}]",flush=True)
     finally:
         if cleanup:
             try:os.unlink(source)
@@ -558,19 +620,22 @@ def run_client():
         if ch.isdigit() and 1<=int(ch)<=len(found):ip,_r,port,kind,shex=found[int(ch)-1]
         else:ip=input("IP: ").strip() or "127.0.0.1";port=ask_port();kind="private";shex=input("Room salt hex: ")
     else:ip=input("IP: ").strip() or "127.0.0.1";port=ask_port();kind="private";shex=input("Room salt hex: ")
-    try:salt=bytes.fromhex(shex);password=GLOBAL_PASSWORD if kind=="global" else input("Room password: ");key=key_from_password(password,salt);aes=AESGCM(key)
+    try:salt=bytes.fromhex(shex)
     except ValueError:print("[Invalid salt]");return
+    password=GLOBAL_PASSWORD if kind=="global" else input("Room password (empty = open room): ")
+    key=key_from_password(password or GLOBAL_PASSWORD,salt);aes=AESGCM(key)
     lock=threading.Lock();sock=None; client_config=config_load()
     try:
-        sock=socket.create_connection((ip,port),10); authenticate_client(sock,key_from_password(password,salt)); sock.settimeout(None); send_text(sock,aes,client_config["nickname"] or input("Nickname: ").strip() or "Guest",lock);reply=receive_frame(sock)
+        sock=socket.create_connection((ip,port),10); authenticate_client(sock,key); sock.settimeout(None); send_text(sock,aes,client_config["nickname"] or input("Nickname: ").strip() or "Guest",lock);reply=receive_frame(sock)
         if decrypt(aes,reply)!="__NICK_OK__":print(decrypt(aes,reply));sock.close();return
     except (OSError,InvalidTag,ValueError,UnicodeError) as e:print(f"[Connection failed: {e}]");return
-    state={"dir":client_config.get("download_dir") or ".","stop":threading.Event()}; clear_terminal(); setup_completion(); print(f"Connected to {ip}:{port}. File and message history starts here."); threading.Thread(target=client_receive,args=(sock,aes,state),daemon=True).start()
+    state={"dir":client_config.get("download_dir") or ".","stop":threading.Event(),"threads":[]}; clear_terminal(); setup_completion(); print(f"Connected to {ip}:{port}. File and message history starts here.")
+    receiver=threading.Thread(target=client_receive,args=(sock,aes,state),daemon=True); state["threads"].append(receiver); receiver.start()
     def heartbeat():
         while not state["stop"].wait(HEARTBEAT_SECONDS):
             try:send_text(sock,aes,"__PING__",lock)
             except OSError:return
-    threading.Thread(target=heartbeat,daemon=True).start()
+    beater=threading.Thread(target=heartbeat,daemon=True); state["threads"].append(beater); beater.start()
     try:
         while True:
             try:line=input("You: ")
@@ -578,8 +643,11 @@ def run_client():
             action,arg=parse_command(line)
             if action=="quit":raise QuitProgram()
             if action=="exit":break
-            if action=="help":print(HELP);continue
-            if action=="usage":print(arg);continue
+            if action in ("help","empty"):
+                if action=="help":print(HELP)
+                continue
+            if action=="usage":print(f"[Usage: {arg}]") if arg else print("[Usage: see /help]");continue
+            if action=="unknown":print(f"[Unknown command: {arg}] Type /help to see every command.");continue
             if action=="upload":
                 for p in paths(arg):client_upload(sock,aes,lock,p)
             elif action=="download_list":send_text(sock,aes,"__LIST__",lock)
@@ -590,13 +658,16 @@ def run_client():
             elif action in ("kick","ban","unban","mute","unmute"):send_text(sock,aes,"__MOD__|"+action+"|"+arg,lock)
             elif action=="download":
                 n,d=download_args(arg);state["dir"]=d;client_config["download_dir"]=d;config_save(client_config);send_text(sock,aes,"__GET__|"+n,lock)
-            else:send_text(sock,aes,line,lock)
+            else:send_text(sock,aes,"__SAY__|"+line,lock)
     except (EOFError,OSError):pass
     finally:
         state["stop"].set()
         try:sock.shutdown(socket.SHUT_RDWR)
         except OSError:pass
-        sock.close()
+        for t in state["threads"]:
+            if t.is_alive():t.join(timeout=2)
+        try:sock.close()
+        except OSError:pass
 
 def run_global():
     print("Global UDP mode is not authenticated; use a strong shared passphrase and do not use it for sensitive data.")
@@ -617,9 +688,14 @@ def run_global():
     try:
         while True:
             text=input("You: ")
-            if text=="/quit":raise QuitProgram()
-            if text=="/exit":return
-            if text=="/help":print(HELP);continue
+            action,arg=parse_command(text)
+            if action=="quit":raise QuitProgram()
+            if action=="exit":return
+            if action in ("help","empty"):
+                if action=="help":print(HELP)
+                continue
+            if action!="say":
+                print("[That command only works inside a hosted room.]");continue
             sock.sendto(encrypt(aes,f"{own}|{nick}: {text}"),("<broadcast>",GLOBAL_PORT))
     except (EOFError,OSError):pass
     finally:sock.close()

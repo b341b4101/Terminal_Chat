@@ -1,9 +1,0 @@
-You: /quit
-
-[Connection closed: [WinError 10038] An operation was attempted on something that is not a socket]Fatal Python error: _enter_buffered_busy: could not acquire lock for <_io.BufferedWriter name='<stdout>'> at interpreter shutdown, possibly due to daemon threads
-Python runtime state: finalizing (tstate=0x00007ffe924dada0)
-
-Current thread 0x00004a34 (most recent call first):
-  <no Python frame>
-
-Extension modules: _cffi_backend (total: 1)

@@ -39,13 +39,13 @@ Implemented in the current version:
 - [x] Add colored message types and optional desktop/terminal notifications.
 - [x] Add configurable and remembered download folders.
 - [x] Add room-owner controls such as muting, kicking, or banning participants.
-- [ ] Add multiple named rooms on one server.
 - [x] Add typing indicators or a composing status.
 
 ## Remaining architecture and distribution work
 
 - [ ] Add protocol-version negotiation and capability discovery.
-- [ ] Add integration tests using local host/client sockets.
+- [x] Add integration tests using local host/client sockets.
+- [x] Fix the reported bugs in `errors.txt` (upload paths, `/quit` shutdown crash, command edges) and harden the control protocol.
 - [ ] Add structured logging with configurable verbosity.
 - [ ] Split `chat.py` into protocol, crypto, file-transfer, room-state, and UI modules.
 - [ ] Add a graphical interface while keeping the terminal interface.
